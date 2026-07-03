@@ -1,0 +1,7 @@
+# Un usuario admin por línea (los que aparecen aquí verán los botones de
+# Exportar Excel en la UI). Las líneas que empiecen por # se ignoran.
+#
+# Cambia esta lista y despliega el fichero a todas las máquinas junto con
+# la app. Los usuarios se comparan contra `getpass.getuser()` del sistema
+# operativo (misma cuenta que usa la app para identificar al empleado).
+fiabarret

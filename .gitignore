@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Base de datos con datos reales de empleados (no versionar)
+tracker.db
+*.db-journal
+
+# Informes generados
+reporte_mes_*.xlsx
+reporte_*.xlsx
+
+# Logs
+*.log
