@@ -1,6 +1,9 @@
 # database.py
 
+import hashlib
+import hmac
 import os
+import secrets
 import sqlite3
 from datetime import datetime, timedelta, date
 
@@ -9,6 +12,13 @@ DB_NAME = "tracker.db"
 ADMINS_FILE = "admins.txt"
 
 HORAS_SEMANA_ESTANDAR = 40  # tope semanal a partir del cual se cuenta como extra
+
+# Hashing de contraseñas: PBKDF2-HMAC-SHA256 con sal por usuario.
+# Formato almacenado: "pbkdf2_sha256$<iters>$<salt_hex>$<hash_hex>"
+_PBKDF2_ALGO = "pbkdf2_sha256"
+_PBKDF2_ITERS = 200_000
+_PBKDF2_SALT_BYTES = 16
+_PBKDF2_HASH_BYTES = 32
 
 
 def get_connection():
@@ -20,12 +30,12 @@ def _admins_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), ADMINS_FILE)
 
 
-def leer_admins():
-    """Devuelve el conjunto de usuarios administradores.
+def _leer_admins_txt():
+    """Lee el conjunto de usuarios administradores desde `admins.txt`.
 
-    Lee `admins.txt` línea por línea, ignora líneas vacías y comentarios
-    (los que empiezan por '#'). Si el fichero no existe, devuelve un set
-    vacío: por defecto NADIE es admin (comportamiento seguro).
+    Se usa solo para migrar a la base de datos la primera vez que se arranca
+    la nueva versión con tabla `empleados`. En la app en marcha, los admins
+    viven en la BD (columna `empleados.is_admin`).
     """
     path = _admins_path()
     if not os.path.exists(path):
@@ -46,8 +56,323 @@ def leer_admins():
 
 
 def es_admin(usuario):
-    """True si `usuario` está en admins.txt."""
-    return usuario in leer_admins()
+    """True si `usuario` está marcado como admin en la tabla `empleados`."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT is_admin FROM empleados WHERE username = ?",
+        (usuario,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return bool(row and row[0])
+
+
+# ---------------------------------------------------------------------------
+# Hashing de contraseñas
+# ---------------------------------------------------------------------------
+
+def _hash_password(password):
+    """Devuelve el hash serializado de `password` con sal aleatoria."""
+    salt = secrets.token_bytes(_PBKDF2_SALT_BYTES)
+    derived = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, _PBKDF2_ITERS, _PBKDF2_HASH_BYTES
+    )
+    return f"{_PBKDF2_ALGO}${_PBKDF2_ITERS}${salt.hex()}${derived.hex()}"
+
+
+def _verify_password(password, stored):
+    """True si `password` coincide con el hash serializado `stored`."""
+    if not stored:
+        return False
+    try:
+        algo, iters_str, salt_hex, hash_hex = stored.split("$")
+    except ValueError:
+        return False
+
+    if algo != _PBKDF2_ALGO:
+        return False
+
+    try:
+        iters = int(iters_str)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(hash_hex)
+    except ValueError:
+        return False
+
+    derived = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, iters, len(expected)
+    )
+    return hmac.compare_digest(derived, expected)
+
+
+# ---------------------------------------------------------------------------
+# Empleados (CRUD + autenticación)
+# ---------------------------------------------------------------------------
+
+def _row_to_empleado(row):
+    """Convierte una fila de `empleados` en un dict."""
+    if row is None:
+        return None
+    return {
+        "id": row[0],
+        "username": row[1],
+        "nombre": row[2],
+        "activo": bool(row[3]),
+        "is_admin": bool(row[4]),
+        "fecha_alta": row[5],
+        "password_change_required": bool(row[6]),
+    }
+
+
+_EMPLEADO_COLS = (
+    "id, username, nombre, activo, is_admin, fecha_alta, password_change_required"
+)
+
+
+def crear_empleado(username, nombre, password, is_admin=False,
+                   activo=True, password_change_required=False):
+    """Crea un empleado. Lanza `ValueError` si el username ya existe."""
+    username = (username or "").strip()
+    nombre = (nombre or "").strip()
+
+    if not username:
+        raise ValueError("El nombre de usuario es obligatorio.")
+    if not nombre:
+        raise ValueError("El nombre del empleado es obligatorio.")
+    if not password:
+        raise ValueError("La contraseña es obligatoria.")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT 1 FROM empleados WHERE username = ?", (username,))
+    if cursor.fetchone():
+        conn.close()
+        raise ValueError(f"Ya existe un empleado con el usuario '{username}'.")
+
+    cursor.execute(
+        """
+        INSERT INTO empleados (
+            username, nombre, password_hash, activo, is_admin,
+            fecha_alta, password_change_required
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            username,
+            nombre,
+            _hash_password(password),
+            1 if activo else 0,
+            1 if is_admin else 0,
+            datetime.now().isoformat(timespec="seconds"),
+            1 if password_change_required else 0,
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def autenticar(username, password):
+    """Valida credenciales.
+
+    Devuelve el dict del empleado si son correctas y está activo.
+    Devuelve `None` en cualquier otro caso (usuario inexistente,
+    contraseña incorrecta o empleado dado de baja).
+    """
+    username = (username or "").strip()
+    if not username or not password:
+        return None
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"SELECT {_EMPLEADO_COLS}, password_hash FROM empleados WHERE username = ?",
+        (username,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    stored_hash = row[-1]
+    if not _verify_password(password, stored_hash):
+        return None
+
+    empleado = _row_to_empleado(row[:-1])
+    if not empleado["activo"]:
+        return None
+
+    return empleado
+
+
+def cambiar_password(username, new_password, force_change_next_login=False):
+    """Actualiza la contraseña de un empleado.
+
+    - Si `force_change_next_login` es False (caso normal, cuando el propio
+      empleado cambia su contraseña), se limpia `password_change_required`.
+    - Si es True (típico de un reseteo hecho por un admin), se activa el
+      flag para que el empleado deba cambiarla en su siguiente login.
+    """
+    if not new_password:
+        raise ValueError("La contraseña no puede estar vacía.")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE empleados
+        SET password_hash = ?, password_change_required = ?
+        WHERE username = ?
+        """,
+        (
+            _hash_password(new_password),
+            1 if force_change_next_login else 0,
+            username,
+        ),
+    )
+    conn.commit()
+    filas = cursor.rowcount
+    conn.close()
+
+    if filas == 0:
+        raise ValueError(f"No existe el empleado '{username}'.")
+
+
+def listar_empleados(incluir_inactivos=True):
+    """Devuelve la lista de empleados (dicts), ordenada por nombre."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    if incluir_inactivos:
+        cursor.execute(
+            f"SELECT {_EMPLEADO_COLS} FROM empleados ORDER BY nombre COLLATE NOCASE"
+        )
+    else:
+        cursor.execute(
+            f"SELECT {_EMPLEADO_COLS} FROM empleados "
+            f"WHERE activo = 1 ORDER BY nombre COLLATE NOCASE"
+        )
+
+    empleados = [_row_to_empleado(r) for r in cursor.fetchall()]
+    conn.close()
+    return empleados
+
+
+def obtener_empleado(username):
+    """Devuelve el dict del empleado o None si no existe."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"SELECT {_EMPLEADO_COLS} FROM empleados WHERE username = ?",
+        (username,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return _row_to_empleado(row)
+
+
+def actualizar_empleado(username, nombre=None, activo=None, is_admin=None):
+    """Actualiza los campos indicados. Solo cambia los que reciben valor."""
+    campos = []
+    valores = []
+
+    if nombre is not None:
+        nombre = nombre.strip()
+        if not nombre:
+            raise ValueError("El nombre no puede estar vacío.")
+        campos.append("nombre = ?")
+        valores.append(nombre)
+
+    if activo is not None:
+        campos.append("activo = ?")
+        valores.append(1 if activo else 0)
+
+    if is_admin is not None:
+        campos.append("is_admin = ?")
+        valores.append(1 if is_admin else 0)
+
+    if not campos:
+        return
+
+    valores.append(username)
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"UPDATE empleados SET {', '.join(campos)} WHERE username = ?",
+        valores,
+    )
+    conn.commit()
+    filas = cursor.rowcount
+    conn.close()
+
+    if filas == 0:
+        raise ValueError(f"No existe el empleado '{username}'.")
+
+
+def hay_algun_admin_activo():
+    """True si existe al menos un admin activo (bootstrap inicial)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT 1 FROM empleados WHERE is_admin = 1 AND activo = 1 LIMIT 1"
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None
+
+
+def _tabla_empleados_esta_vacia(cursor):
+    cursor.execute("SELECT 1 FROM empleados LIMIT 1")
+    return cursor.fetchone() is None
+
+
+def _migrar_empleados_desde_datos_existentes(cursor):
+    """Bootstrap suave la primera vez que existe la tabla `empleados`.
+
+    - Crea un empleado por cada `usuario` distinto encontrado en `jornadas`,
+      con nombre = username y contraseña temporal marcada como
+      `password_change_required` para que la actualicen al primer login.
+    - Marca como admin a los usuarios listados en `admins.txt`.
+
+    La contraseña temporal es "cambiar" — el flag obliga a cambiarla.
+    """
+    cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jornadas'"
+    )
+    tiene_jornadas = cursor.fetchone() is not None
+    if not tiene_jornadas:
+        return
+
+    cursor.execute("SELECT DISTINCT usuario FROM jornadas WHERE usuario IS NOT NULL")
+    usuarios = [row[0] for row in cursor.fetchall() if row[0]]
+    if not usuarios:
+        return
+
+    admins_txt = _leer_admins_txt()
+    ahora = datetime.now().isoformat(timespec="seconds")
+
+    for usuario in usuarios:
+        password_hash = _hash_password("cambiar")
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO empleados (
+                username, nombre, password_hash, activo, is_admin,
+                fecha_alta, password_change_required
+            )
+            VALUES (?, ?, ?, 1, ?, ?, 1)
+            """,
+            (
+                usuario,
+                usuario,
+                password_hash,
+                1 if usuario in admins_txt else 0,
+                ahora,
+            ),
+        )
 
 
 def init_db():
@@ -72,6 +397,24 @@ def init_db():
             fin DATETIME
         )
     """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS empleados (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            nombre TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            activo INTEGER NOT NULL DEFAULT 1,
+            is_admin INTEGER NOT NULL DEFAULT 0,
+            fecha_alta TEXT NOT NULL,
+            password_change_required INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+
+    # Migración suave: si la tabla `empleados` acaba de crearse y ya había
+    # jornadas registradas, sembramos empleados con contraseña temporal.
+    if _tabla_empleados_esta_vacia(cursor):
+        _migrar_empleados_desde_datos_existentes(cursor)
 
     conn.commit()
     conn.close()

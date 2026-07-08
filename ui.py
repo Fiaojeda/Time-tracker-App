@@ -1,4 +1,3 @@
-import getpass
 import os
 from datetime import datetime
 
@@ -34,8 +33,8 @@ from database import (
     desglose_por_semanas_mes,
     HORAS_SEMANA_ESTANDAR,
     exportar_todos_empleados_mes_excel,
-    es_admin,
 )
+from auth_ui import EmpleadosDialog
 
 
 # ----------------------------------------------------------------------------
@@ -188,16 +187,19 @@ class WeekChartCanvas(FigureCanvasQTAgg):
 
 class TimeTrackerApp(QWidget):
 
-    def __init__(self):
+    def __init__(self, empleado):
         super().__init__()
 
         self.setWindowTitle("Time Tracker")
         self.setMinimumSize(300, 200)
 
-        self.usuario = getpass.getuser()
-        # Rol: sólo los usuarios listados en admins.txt pueden exportar Excel.
-        # Los empleados normales no verán los botones de export.
-        self.is_admin = es_admin(self.usuario)
+        # `empleado` es el dict devuelto por autenticar() en el flujo de login.
+        self.empleado = empleado
+        self.usuario = empleado["username"]
+        self.nombre = empleado["nombre"]
+        # Rol: sólo los admins pueden exportar Excel y gestionar empleados.
+        # Los empleados normales no verán esos botones.
+        self.is_admin = empleado["is_admin"]
         self.jornada = get_today_jornada(self.usuario)
 
         if not self.jornada:
@@ -235,8 +237,9 @@ class TimeTrackerApp(QWidget):
         self.label_resumen = QLabel("0.00h")
         self.label_resumen.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-        grid_j.addWidget(QLabel("Usuario"), 0, 0)
-        grid_j.addWidget(self._val(self.usuario), 0, 1)
+        grid_j.addWidget(QLabel("Empleado"), 0, 0)
+        etiqueta_empleado = self._val(f"{self.nombre}  ({self.usuario})")
+        grid_j.addWidget(etiqueta_empleado, 0, 1)
         grid_j.addWidget(QLabel("Inicio"), 1, 0)
         grid_j.addWidget(self._val(hora_inicio), 1, 1)
         grid_j.addWidget(QLabel("Estado"), 2, 0)
@@ -272,10 +275,10 @@ class TimeTrackerApp(QWidget):
         row_botones.addWidget(self.btn_finalizar)
         row_botones.addWidget(self.btn_reanudar)
 
-        # -------- Botón export (solo admin) --------
-        # Los empleados no ven este botón para evitar que puedan descargar
-        # el Excel y editar horas manualmente. Sólo los usuarios listados
-        # en admins.txt tienen acceso.
+        # -------- Botones de admin --------
+        # Los empleados normales no ven estos botones para evitar que puedan
+        # descargar el Excel/editar empleados. Sólo los usuarios marcados
+        # como admin en la tabla `empleados` tienen acceso.
         # El reporte es MENSUAL y consolidado: incluye a TODOS los empleados
         # en un único fichero, se descarga una vez al mes.
         row_export = None
@@ -283,7 +286,11 @@ class TimeTrackerApp(QWidget):
             self.btn_export_all = QPushButton("Exportar reporte mensual (todos)")
             self.btn_export_all.clicked.connect(self.export_all_month)
 
+            self.btn_empleados = QPushButton("Gestión de empleados…")
+            self.btn_empleados.clicked.connect(self.abrir_panel_empleados)
+
             row_export = QHBoxLayout()
+            row_export.addWidget(self.btn_empleados)
             row_export.addWidget(self.btn_export_all)
 
         # -------- Card: Rendimiento del mes (oculto por defecto,
@@ -553,6 +560,18 @@ class TimeTrackerApp(QWidget):
         is_dark = pal.color(QPalette.Window).lightness() < 128
         self.chart_semanas.apply_theme(is_dark)
         self.chart_semanas.plot(semanas, HORAS_SEMANA_ESTANDAR)
+
+    def abrir_panel_empleados(self):
+
+        if not self.is_admin:
+            QMessageBox.warning(
+                self, "Acceso restringido",
+                "Solo un administrador puede gestionar empleados."
+            )
+            return
+
+        dlg = EmpleadosDialog(self, current_username=self.usuario)
+        dlg.exec()
 
     def export_all_month(self):
 
