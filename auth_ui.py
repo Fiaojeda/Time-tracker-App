@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 
-from database import (
+from data import (
     autenticar,
     cambiar_password,
     crear_empleado,
@@ -98,7 +98,12 @@ class LoginDialog(QDialog):
             self._mostrar_error("Introduce usuario y contraseña.")
             return
 
-        empleado = autenticar(username, password)
+        try:
+            empleado = autenticar(username, password)
+        except ConnectionError as exc:
+            self._mostrar_error(str(exc))
+            return
+
         if not empleado:
             self._mostrar_error("Usuario o contraseña incorrectos.")
             self.input_pass.clear()

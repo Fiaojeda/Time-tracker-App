@@ -4,7 +4,7 @@ import sys
 
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
-from database import (
+from data import (
     init_db,
     get_today_jornada,
     create_jornada,
@@ -58,14 +58,22 @@ def run_login_flow():
 
 if __name__ == "__main__":
 
-    init_db()
-
     # QApplication tiene que existir antes de mostrar cualquier QDialog.
     app = QApplication(sys.argv)
 
     # Que el cierre de la última ventana NO cierre la app (queremos que
     # siga viva en el tray).
     app.setQuitOnLastWindowClosed(False)
+
+    try:
+        init_db()
+    except Exception as exc:
+        QMessageBox.critical(
+            None,
+            "Error de conexión",
+            str(exc),
+        )
+        sys.exit(1)
 
     empleado = run_login_flow()
     if empleado is None:

@@ -19,6 +19,9 @@ env/
 tracker.db
 *.db-journal
 
+# Config local (cada PC apunta a su server_url)
+config.json
+
 # Informes generados
 reporte_mes_*.xlsx
 reporte_*.xlsx

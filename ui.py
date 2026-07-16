@@ -17,7 +17,7 @@ TRAY_ICON_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "assets", "clock.png"
 )
 
-from database import (
+from data import (
     get_today_jornada,
     iniciar_pausa,
     obtener_pausa_activa,
